@@ -3,6 +3,11 @@ Script to create partitions on AHV hosts and create Jarvis entries of virtual
 node.
 Author: gokul.kannan@nutanix.com
 Copyright (c) 2019 Nutanix Inc. All rights reserved.
+
+Usage:
+./partition_disks_ahv.py --host_ip=<host ip> --base_cvm_ip=<cvm ip>
+  --num_nodes=<num nodes to create>
+
 """
 
 import argparse
