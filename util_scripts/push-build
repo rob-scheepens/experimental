@@ -1,0 +1,759 @@
+#!/usr/bin/python
+#
+# Copyright (c) 2015 Nutanix Inc. All rights reserved.
+#
+# Author: pw@nutanix.com
+#
+# Summary
+# -------
+# Transfer an executable and its needed shared libraries to a single node
+# or to an entire cluster. Update their RUNPATH entries to work on the cluster
+# in the process.
+#
+# See http://wikid.nutanix.com/wiki/User:Pw/Shlib for more info.
+#
+# Quick start
+# -----------
+# The best way to use this tool is to _name_ your builds and push them
+# in such a way that it is easy to switch between them for testing, so:
+#
+#   tools/build/push-build -c heisenbug -d bug-30201 curator
+#
+# Then you can use 'select-build' on the SVM to start running the curator
+# from the bug-30201 directory, or to switch back to the original install:
+#
+#   select-build bug-30201  # Try my new code.
+#   select-build stock      # Oh scary! Switch back to original install.
+#
+# Single-node push
+# ----------------
+# Copy stargate and its libraries to just one node, either hostname or IP
+# address. Or any other binary in the tree and its libraries.
+#
+#   tools/build/push-build -s oberon-c1 -d fix-segv stargate
+#   tools/build/push-build -s 10.60.4.59 -d new-patch \
+#     build/tools/vdisk_manipulator/vdisk_manipulator
+#
+# Start using that code on the SVM with, e.g.:
+#
+#   select-build --only new-patch
+#
+# Generating a tarball
+# --------------------
+# You can also just generate a tarball then transport the bits
+# yourself by hand:
+#
+#   tools/build/push-build --tarball -d new-cc chronos
+#
+# Copy this wherever you need, then untar and manually install
+# the new code:
+#
+#   scp build/push-tarball/new-cc.tgz cluster-c1:
+#   ssh cluster-c1
+#   tar xfz new-cc.tgz
+#   mv bin/chronos{,.orig}
+#   ln -s /home/nutanix/builds/new-cc/chronos bin/chronos
+#   genesis stop chronos ; cluster start
+#
+# To put back the original, do:
+#
+#   rm bin/stargate
+#   mv bin/stargate{.orig,}
+#   genesis stop stargate ; cluster start
+
+# For use on a CVM.
+try:
+  import env
+  def top_dir():
+    return os.getcwd()
+except:
+  from util.base.build import top_dir
+
+import gflags
+import json
+import optparse
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import urllib
+
+from util.base.log import initialize as log_initialize
+from util.net.ssh_client import (SSHClient, PersistentSSHClient,
+                                 default_private_key)
+
+# Pushes using --directory are installed under this directory.
+kHomeNutanixBuilds = "/home/nutanix/builds"
+
+#------------------------------------------------------------------------------
+
+# Handy list of common executables to location in the build tree. If
+# the right-hand-side is a directory, then the key is used as the filename
+# in that directory. TODO: auto-extract these from CMake.
+executable_short_names = {
+  "alert_manager"          : "alerts/manager",
+  "apps_server"            : "apps/apps_server",
+  "arithmos"               : "stats/arithmos",
+  "cassandra_monitor"      : "util/cassandra/cassandra_monitor",
+  "cerebro"                : "cerebro/cerebro_main",
+  "chronos"                : "chronos/node/chronos_node_main",
+  "consistency_checker"    : "qa/tools/consistency_checker",
+  "curator"                : "curator",
+  "data_generator_launcher": "qa/tools/integrity_validator",
+  "dedup_loader"           : "qa/tools/dedup",
+  "dedup_reader"           : "qa/tools/dedup",
+  "disk_perf"              : "qa/tools/disk_perf",
+  "disk_write"             : "qa/tools/stargate_tools",
+  "dynamic_ring_changer"   : "medusa/ring_change",
+  "integrity_tester"       : "qa/tools/integrity_tester",
+  "leveldb_client"         : "qa/tools/integrity_tester",
+  "medusa_bm"              : "qa/tools/medusa_bm",
+  "migrate_extents_cli"    : "qa/tools/stargate_tools",
+  "persistence_verifier"   : "qa/tools/persistence_verifier",
+  "pithos"                 : "pithos/server/pithos_server_main",
+  "shell_vdisk_creator"    : "tools/shell_vdisk_creator",
+  "stargate"               : "stargate",
+  "workload_replay_io"     : "tools/workload_analysis",
+}
+
+#------------------------------------------------------------------------------
+
+def FATAL(s):
+  print >>sys.stderr, "FATAL: %s" % s
+  sys.exit(1)
+
+#------------------------------------------------------------------------------
+
+class TransferDest(object):
+  """Represents a cluster or SVM to which builds will be transferred."""
+
+  kPushBuildPort = 2076
+
+  def __init__(self, name, opts, nodes=None, auto_discover_nodes=False):
+    self.name = name
+    # Only clusters have nodes. For SVMs this is None.
+    self.nodes = nodes
+    self.auto_discover_nodes = auto_discover_nodes
+    self.opts = opts
+
+  @property
+  def first_host(self):
+    """The first node in the cluster, or the single SVM."""
+    if self.nodes:
+      return self.nodes[0]
+    return self.name
+
+  def ssh_fail_msg(self, what, rv, out, err):
+    """Print the failed command."""
+    s = "%s failed, ret %s" % (what, rv)
+    if out:
+      s += "\nOut: %s" % out.rstrip()
+    if err:
+      s += "\nErr: %s" % err.rstrip()
+    return s
+
+  def ssh_execute_or_fail(self, what, cmd, **kwargs):
+    rv, out, err = self.ssh.execute(cmd, **kwargs)
+    if rv != 0:
+      FATAL(self.ssh_fail_msg(what + " on " + self.first_host, rv, out, err))
+    return out
+
+  def split_host_port(self, address):
+    """Split an address which potentially has a ":port" trailer."""
+    a = address.split(":")
+    if len(a) == 2:
+      host = a[0]
+      port = a[1]
+    else:
+      host = self.first_host
+      port = None
+    return host, port
+
+  def connect_persistent(self):
+    """Make a persistent ssh connection which will be faster than logging in
+       again for every command."""
+
+    print "Start up persistent ssh connection to %s." % self.first_host
+    host, port = self.split_host_port(self.first_host)
+    self.ssh = PersistentSSHClient(host,
+                                   "nutanix",
+                                   private_key=default_private_key(),
+                                   quiet_mode=False,
+                                   port=port)
+    rv, out, err = self.ssh.execute("hostname")
+    return rv == 0
+
+  def connect_password(self, password):
+    """Try connecting with password.
+       TODO(pw): Refactor ssh_client.py so it can use Persistent connections
+       even with password authentication."""
+    print "Connecting to %s with password authentication." % self.first_host
+    host, port = self.split_host_port(self.first_host)
+    self.ssh = SSHClient(host, "nutanix", password=password, port=port)
+    rv, out, err = self.ssh.execute("hostname")
+    return rv == 0
+
+  def connect(self):
+    """Connect either with a persistent connection, if ssh key works, else
+       use a password. If --password is given, that overrides the test for
+       an ssh key."""
+    if self.opts.password:
+      if not self.connect_password(self.opts.password):
+        FATAL("Could not ssh to %s, bad hostname/IP/password?" %
+              self.first_host)
+    else:
+      if not self.connect_persistent():
+        if not self.connect_password("nutanix/4u"):
+          FATAL("Could not ssh to %s, bad hostname/IP? "
+                "Or try \"-p password\"" % self.first_host)
+
+    if self.auto_discover_nodes:
+      self.discover_nodes()
+
+  def discover_nodes(self):
+    """Use svmips to figure out all the nodes in the cluster."""
+    out = self.ssh_execute_or_fail("svmips", "svmips")
+    svmips = out.strip().split()
+
+    out = self.ssh_execute_or_fail("getip", "PS1=xx . /etc/profile; getip")
+    myip = out.strip()
+
+    self.nodes = [self.name]
+    for svmip in svmips:
+      if svmip != myip:
+        self.nodes.append(svmip)
+
+    print "Auto-discovered cluster: " + " ".join(self.nodes)
+
+  def prepare(self):
+    """Move in required binaries and make the directory structure."""
+    # Make the builds/ or root directories if needed.
+    cmd = "mkdir -p %s %s" % (self.opts.lib_dir, self.opts.bin_dir)
+    self.ssh_execute_or_fail("mkdirs", cmd)
+
+    # Make the dirs on the other nodes too.
+    if self.nodes:
+      self.execute_inside("mkdirs", cmd)
+
+    # Install a copy of select-build to help manage the builds, and
+    # send over chrpath, which is needed to update RUNPATH on the cluster.
+    if self.opts.chrpath is not None:
+      # Only used for diagnostics.py.
+      self.rsync_to([self.opts.chrpath], self.opts.bin_dir)
+    else:
+      self.rsync_to(["/usr/bin/chrpath", "tools/build/select-build"],
+                    self.opts.chrpath_bin_dir)
+
+    # And copy these internally.
+    if self.nodes:
+      self.rsync_inside(["select-build", "chrpath"],
+                        self.opts.chrpath_bin_dir, "")
+
+  def preserve_stock(self):
+    """When installing to /usr/local/nutanix, make sure a copy is saved so
+       that it will be possible to revert."""
+
+    assert not self.opts.directory
+
+    # See if there is already a stock directory.
+    cmd = "test -d %s/stock && echo yes || echo no" % kHomeNutanixBuilds
+    out = self.ssh_execute_or_fail("test stock", cmd).rstrip()
+    if out == "yes":
+      return
+    elif out == "no":
+      pass
+    else:
+      FATAL(self.ssh_fail_msg("odd test stock reply on " + self.first_host,
+                              rv, out, err))
+
+    print "Preserve original install in %s/stock." % kHomeNutanixBuilds
+    bin_dir = "%s/stock/bin" % kHomeNutanixBuilds
+    lib_dir = "%s/stock/lib" % kHomeNutanixBuilds
+    cmd = "mkdir -p %s %s" % (bin_dir, lib_dir)
+    self.ssh_execute_or_fail("mkdir stock", cmd)
+    cmd = "rsync -a --exclude=*/ --exclude=*.jar " + \
+          "%s/ %s/" % (self.opts.lib_dir, lib_dir)
+    self.ssh_execute_or_fail("stock lib rsync", cmd, timeout_secs=120)
+    cmd = "rsync -a %s/ %s/" % (self.opts.bin_dir, bin_dir)
+    self.ssh_execute_or_fail("stock bin rsync", cmd, timeout_secs=120)
+
+  def preseed(self):
+    """If the transfer directory is empty, see if there is another build that
+       we can preseed from to make rsync go faster."""
+
+    assert self.opts.directory
+
+    # Gather the sizes of the builds in here already. Must do separate du
+    # or it will not count the hardlinks. Output will look like:
+    #   dir1
+    #   601
+    #   1451498880
+    #   dir3
+    #   601
+    #   1451502163
+    cmd = "cd builds && for i in *; do echo $i; " + \
+          "du -sm $i | cut -f1; stat -c %Y $i; done"
+    out = self.ssh_execute_or_fail("stat/du", cmd)
+    sizes = {}
+    times = {}
+    lines = out.splitlines()
+    num_dirs = len(lines) / 3
+    if len(lines) % 3 != 0 or num_dirs < 1:
+      FATAL(self.ssh_fail_msg("stat/du lengths on " + self.first_host,
+                              rv, out, err))
+    for i in range(num_dirs):
+      name = lines[3 * i]
+      sizes[name] = int(lines[3 * i + 1])
+      times[name] = int(lines[3 * i + 2])
+
+    # If there is something in here already, just rsync on top of it.
+    if sizes[self.opts.directory] > 10:
+      return
+
+    # See if there is a nearby lib we could use. Pick the most recently
+    # modified one, or just use /usr/local/lib.
+    del times[self.opts.directory]
+    newest = None
+    if len(times) > 0:
+      kv = sorted(times.items(), key=lambda nt: nt[1], reverse=True)[0]
+      newest = kv[0]
+
+    if newest is not None:
+      print "Preseeding from existing directory %s." % newest
+      cmd = "cd builds && cp -lr %s/* %s" % (newest, self.opts.directory)
+      self.ssh_execute_or_fail("cp -lr", cmd)
+    else:
+      assert self.opts.lib_dir != "/usr/local/nutanix/lib"
+      print "Preseeding from /usr/local/nutanix."
+      cmd = "rsync -a --exclude=*/ --exclude=*.jar " + \
+            "/usr/local/nutanix/lib/ %s" % self.opts.lib_dir
+      self.ssh_execute_or_fail("rsync /usr/local/nutanix", cmd,
+                               timeout_secs=300)
+
+  def run_chrpath(self, exe_dir, exe_names, lib_dir):
+    """Run chrpath to make these executables point to this library."""
+    cmd = "cd %s && %s/chrpath -r %s %s" % \
+          (exe_dir, self.opts.chrpath_bin_dir, lib_dir, " ".join(exe_names))
+    self.ssh_execute_or_fail("chrpath", cmd)
+    if self.nodes:
+      self.execute_inside("chrpath", r'\"' + cmd + r'\"')
+
+  def execute_inside(self, what, cmd):
+    """Run this on all nodes, not in parallel, though."""
+    for node in self.nodes[1:]:
+      node_cmd = 'ssh %s "%s"' % (node, cmd)
+      self.ssh_execute_or_fail("%s on %s" % (what, node), node_cmd)
+
+  def rsync_to(self, local_files, remote_dir, rsync_args=""):
+    """Rsync this file over there, with a very long timeout for slow links."""
+    if self.opts.dryrun:
+      rsync_args += " -n"
+    if self.opts.verbose:
+      rsync_args += " -v"
+    rv, out, err = self.ssh.transfer_to(" ".join(local_files), remote_dir,
+                                        use_rsync=True,
+                                        timeout_secs=3600,
+                                        extra_opts=rsync_args)
+    if rv != 0:
+      FATAL(self.ssh_fail_msg("rsync to " + self.first_host, rv, out, err))
+    if self.nodes:
+      self.rsync_inside([os.path.basename(f) for f in local_files],
+                        remote_dir,
+                        rsync_args)
+
+  def rsync_inside(self, src_files, both_dir, rsync_args):
+    """Ask node 0 to rsync to all the other nodes, in parallel."""
+    cmd = "cd %s && " % both_dir
+    cmd += "for node in " + " ".join(self.nodes[1:]) + "; do "
+    cmd += "rsync %s %s $node:%s/" % \
+           (rsync_args, " ".join(src_files), both_dir)
+    cmd += "& done; wait"
+    self.ssh_execute_or_fail("rsync_inside", cmd, timeout_secs=120)
+
+#------------------------------------------------------------------------------
+
+def process_args():
+  p = optparse.OptionParser(usage="Usage: %prog [options] executable...")
+  p.add_option("-c", "--cluster", dest="clusters", action="append",
+               metavar="CLUSTER",
+               help="Transfer executables to all nodes in CLUSTER.")
+  p.add_option("-s", "--svm", dest="svms", action="append", metavar="SVM",
+               help="Transfer executables to SVM (name or IP address).")
+  p.add_option("-d", "--directory",
+               help="Directory name in %s to place executable and libraries" %
+                     kHomeNutanixBuilds)
+  p.add_option("-t", "--tarball", action="store_true",
+               help="Package up everything needed in a tarball.")
+  p.add_option("-p", "--password",
+               help="Use this password instead of private key or nutanix/4u")
+  p.add_option("-r", "--root",
+               help="Put files here instead of /usr/local/nutanix")
+  p.add_option("--chrpath", help="Location of chrpath on dev VM, " +
+                                 "default is /usr/bin/chrpath")
+  p.add_option("-n", "--dryrun", action="store_true",
+               help="Just show what would be transferred.")
+  p.add_option("-v", "--verbose", action="store_true",
+               help="Show all rsync output.")
+  opts, args = p.parse_args()
+  if len(args) == 0:
+    p.error("Must specify one or more executables")
+
+  if opts.svms is None:
+    opts.svms = []
+  if opts.clusters is None:
+    opts.clusters = []
+
+  # Make sure there is something to do.
+  if not (opts.clusters or opts.svms or opts.tarball):
+    p.error("Specify a --cluster or --svm to transfer to, or use --tarball.")
+
+  # Turn on gflag debugging if --verbose for SSHClient.
+  if opts.verbose:
+    gflags.FLAGS.debug = True
+    log_initialize()
+
+  # Only support --tarball if a directory is given.
+  if opts.tarball and not opts.directory:
+    p.error("Specify the build name for your tarball, with --directory.")
+
+  if opts.root and opts.directory:
+    p.error("Cannot specify --root along with --directory.")
+
+  # Where to put the build. If --directory, in a separate directory under
+  # builds/, else directly to /usr/local/nutanix.
+  if opts.directory:
+    if opts.directory.find("/") >= 0:
+      FATAL("Option --directory must be a base name that wil appear under %s" %
+            kHomeNutanixBuilds)
+    if opts.directory == "stock":
+      FATAL("Directory name \"stock\" is reserved for saving the original " +
+            "install")
+    root_dir = kHomeNutanixBuilds + "/" + opts.directory
+    # Even with --directory, still put chrpath and select-build global.
+    chrpath_root_dir = "/usr/local/nutanix"
+  elif opts.root:
+    if opts.root[0] != "/":
+      # Make it relative to home.
+      root_dir = "/home/nutanix/" + opts.root
+    else:
+      root_dir = opts.root
+    # If told to go someplace different, put chrpath over there.
+    chrpath_root_dir = root_dir
+  else:
+    root_dir = "/usr/local/nutanix"
+    chrpath_root_dir = root_dir
+
+  # Where things will land on the SVM.
+  opts.lib_dir = root_dir + "/lib"
+  opts.bin_dir = root_dir + "/bin"
+  opts.chrpath_bin_dir = chrpath_root_dir + "/bin"
+
+  return opts, args
+
+#------------------------------------------------------------------------------
+
+def find_executables(args):
+  """Locate the main executables that we want to transfer."""
+  # Move into top_dir() so that shlib detection work can use relative
+  # paths via build/.
+  cwd = os.getcwd()
+  top = top_dir()
+  if cwd != top:
+    print "Moving into top_dir %s" % top
+    os.chdir(top)
+  print "Collect executable list."
+  executables = []
+  for exe in args:
+    if os.access(exe, os.R_OK):
+      # If there is an executable file with this name, use it.
+      sb = os.stat(exe)
+      if stat.S_ISREG(sb.st_mode) and stat.S_IMODE(sb.st_mode) & stat.S_IXUSR:
+        executables.append(exe)
+        continue
+    if exe in executable_short_names.keys():
+      # Could be a file or a directory to the file. Make sure it is in the
+      # build tree.
+      exe_path = "build/" + executable_short_names[exe]
+      if not os.access(exe_path, os.R_OK):
+        FATAL("Short executable name %s has no file or directory %s" %
+              (exe, exe_path))
+      sb = os.stat(exe_path)
+      if stat.S_ISDIR(sb.st_mode):
+        exe_path += "/" + exe
+        if not os.access(exe_path, os.R_OK):
+          FATAL("Short executable name %s has no file %s" % (exe, exe_path))
+      executables.append(exe_path)
+    else:
+      FATAL("No such executable " + exe)
+  return executables
+
+#------------------------------------------------------------------------------
+
+def gather_all_shlibs(executables):
+  """For each executable, collect its requirements."""
+  print "Collect shared library list."
+  shlibs = Shlibs()
+  for exe in executables:
+    gather_shlibs(exe, shlibs)
+  return shlibs
+
+#------------------------------------------------------------------------------
+
+def gather_shlibs(exe, shlibs):
+  """Extract the shlib dependencies from a binary and add them to the list."""
+  p = subprocess.Popen(["objdump", "-p", exe],
+                       stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+  out, err = p.communicate()
+  if p.returncode:
+    msg = ""
+    if out:
+      msg += "Out: %s" % out.rstrip()
+    if err:
+      if out:
+        msg += ", "
+      msg += "Err: %s" % err.rstrip()
+    FATAL("Objdump %s failed: %s" % (exe, msg))
+  for line in out.splitlines():
+    m = re.match(r"\s*NEEDED\s+(.*)\s*", line)
+    if m:
+      shlibs.find(m.group(1))
+
+#------------------------------------------------------------------------------
+
+class Shlibs(object):
+  """Keeps track of all the shared libraries needed by the executables."""
+  def __init__(self):
+    # The base names of shlibs that were found. These are the names that
+    # objdump -p shows.
+    self.found = set()
+
+    # In-tree paths to toolchain, build, and /usr/local/nutanix/lib shlibs,
+    # respectively.
+    self.toolchain = set()
+    self.build = set()
+    self.usr_local = set()
+
+  kToolchainPrefix = "build/toolchain/shlib/"
+  kBuildPrefix = "build/shlib/"
+  kUsrLocalPrefix = "/usr/local/nutanix/lib/"
+
+  def find(self, shlib):
+    """Find one shlib."""
+    # Did we already find it?
+    if shlib in self.found:
+      return
+    if not self.find_in_toolchain(shlib):
+      if not self.find_in_build(shlib):
+        self.find_in_usr_local(shlib)
+    # Else it must be on the system already, in /lib64 or similar. Anyway,
+    # remember that we looked for it.
+    self.found.add(shlib)
+
+  def find_in_toolchain(self, shlib):
+    """Is it in the toolchain?"""
+    toolchain_path = self.kToolchainPrefix + shlib
+    if not os.access(toolchain_path, os.R_OK):
+      return False
+    self.toolchain.add(toolchain_path)
+    sb = os.lstat(toolchain_path)
+    if stat.S_ISLNK(sb.st_mode):
+      # Always add the symlink (above) and its referent, which is in the
+      # same directory here.
+      self.toolchain.add(self.kToolchainPrefix + os.readlink(toolchain_path))
+    return True
+
+  def find_in_build(self, shlib):
+    """Is it in the build?"""
+    build_path = self.kBuildPrefix + shlib
+    if not os.access(build_path, os.R_OK):
+      return False
+    sb = os.lstat(build_path)
+    if not stat.S_ISLNK(sb.st_mode):
+      FATAL("Build shlib not a symlink: %s" % build_path)
+    self.build.add(
+      os.path.normpath(self.kBuildPrefix + os.readlink(build_path)))
+    return True
+
+  def find_in_usr_local(self, shlib):
+    """Could it already be installed on an SVM?"""
+    usr_local_path = self.kUsrLocalPrefix + shlib
+    if not os.access(usr_local_path, os.R_OK):
+      return False
+    self.usr_local.add(usr_local_path)
+    sb = os.lstat(usr_local_path)
+    if stat.S_ISLNK(sb.st_mode):
+      # Always add the symlink (above) and its referent, which is in the
+      # same directory here.
+      self.usr_local.add(self.kUsrLocalPrefix + os.readlink(usr_local_path))
+    return True
+
+#------------------------------------------------------------------------------
+
+def ensure_chrpath_installed(opts):
+  """Make sure the chrpath binary is installed on the dev VM."""
+  if opts.chrpath:
+    chrpath = opts.chrpath
+  else:
+    chrpath = "/usr/bin/chrpath"
+  if not os.access(chrpath, os.X_OK):
+    FATAL("No %s found. Run tools/setup-centos-dev.sh" % chrpath)
+
+#------------------------------------------------------------------------------
+
+def make_tarball(opts, executables, shlibs):
+  """Package up all the dependencies to make a tarball. When expanded it
+     will put files in the relative directory given by --directory."""
+  # Construct a temporary area down in the build dir.
+  tarball_root = "build/push-tarball"
+  tmpdir = tarball_root + "/builds/" + opts.directory
+  shutil.rmtree(tmpdir, ignore_errors=True)
+  tar_bin_dir = tmpdir + "/bin"
+  tar_lib_dir = tmpdir + "/lib"
+  os.makedirs(tar_bin_dir)
+  os.makedirs(tar_lib_dir)
+
+  # Copy in the exes to run chrpath on them.
+  for exe in executables:
+    shutil.copy(exe, tar_bin_dir)
+  cmd = ["/usr/bin/chrpath", "-r", opts.lib_dir]
+  cmd.extend([os.path.basename(exe) for exe in executables])
+  subprocess.check_call(cmd, cwd=tar_bin_dir, stdout=subprocess.PIPE)
+
+  # Copy in the toolchain shlibs.
+  for shlib in shlibs.toolchain:
+    sb = os.lstat(shlib)
+    dest = tar_lib_dir + "/" + os.path.basename(shlib)
+    if stat.S_ISLNK(sb.st_mode):
+      os.symlink(os.readlink(shlib), dest)
+    else:
+      shutil.copy(shlib, dest)
+
+  # Make a hard-link farm for the build shlibs.
+  for shlib in shlibs.build:
+    dest = tar_lib_dir + "/" + os.path.basename(shlib)
+    os.link(shlib, dest)
+
+  # Copy in select-build and chrpath for convenience.
+  shutil.copy(opts.chrpath or "/usr/bin/chrpath", tar_bin_dir + "/chrpath")
+  shutil.copy("tools/build/select-build", tar_bin_dir + "/select-build")
+
+  # Run tar.
+  print "Run tar."
+  tarball_name = opts.directory + ".tgz"
+  subprocess.check_call("tar cf - builds/%s | pigz >%s" %
+                        (opts.directory, tarball_name),
+                        cwd=tarball_root, shell=True)
+
+  # Clean up.
+  shutil.rmtree(os.path.dirname(tmpdir), ignore_errors=True)
+  print "Created tarball: %s/%s" % (tarball_root, tarball_name)
+
+#------------------------------------------------------------------------------
+
+def resolve_hosts(opts):
+  """Look up the clusters in jarvis to find their IPs, and build
+     the list of TransferDest."""
+  transfer_dest = []
+
+  for cluster in opts.clusters:
+    url = "http://jarvis.eng.nutanix.com/api/v1/clusters/" + cluster
+    d = urllib.urlopen(url).read()
+    j = json.loads(d)
+    if j["success"]:
+      dest = TransferDest(cluster, opts,
+                          nodes=[n["svm_ip"] for n in j["data"]["nodes"]])
+    else:
+      print "Cluster %s not found in jarvis, will auto-discover." % cluster
+      dest = TransferDest(cluster, opts, auto_discover_nodes=True)
+    transfer_dest.append(dest)
+
+  for svm_list in opts.svms:
+    # Treat a comma-separated list as multiple svms, for convenience.
+    for svm in svm_list.split(","):
+      transfer_dest.append(TransferDest(svm, opts))
+  return transfer_dest
+
+#------------------------------------------------------------------------------
+
+def transfer(transfer_dest, opts, executables, shlibs):
+  """Send all the data to all the SVMs and all cluster first-hosts."""
+
+  # Copy in select-build, chrpath, and make directories.
+  print "Prepare environment on SVMs."
+  for dest in transfer_dest:
+    dest.prepare()
+
+  # Preserve original libraries if we'll be overwriting /usr/local/nutanix.
+  if not opts.directory:
+    for dest in transfer_dest:
+      dest.preserve_stock()
+
+  # See if there is another build we can preseed from.
+  if opts.directory:
+    for dest in transfer_dest:
+      dest.preseed()
+
+  # Move in the shared libraries.
+  if shlibs.toolchain or shlibs.build or shlibs.usr_local:
+    print "Transfer shared libraries."
+    all_shlibs = list(shlibs.toolchain | shlibs.build | shlibs.usr_local)
+    for dest in transfer_dest:
+      dest.rsync_to(all_shlibs, opts.lib_dir, "--links")
+
+  # And copy the executables, to bin/ or to the specified directory.
+  print "Transfer executables."
+  for dest in transfer_dest:
+    dest.rsync_to(executables, opts.bin_dir)
+
+  # Run chrpath on everything transferred.
+  if shlibs.toolchain or shlibs.build or shlibs.usr_local:
+    print "Run chrpath."
+    relative_exes = [os.path.basename(exe) for exe in executables]
+    for dest in transfer_dest:
+      dest.run_chrpath(opts.bin_dir, relative_exes, opts.lib_dir)
+
+  if opts.directory:
+    only = ""
+    if len(transfer_dest) == 1:
+      if transfer_dest[0].nodes is None:
+        only = "--only "
+        what = "SVM %s" % transfer_dest[0].name
+      else:
+        what = "cluster %s" % transfer_dest[0].name
+    else:
+      what = "the SVMs/clusters"
+    print "Done! You can do " + \
+          "\"select-build %s%s\" " % (only, opts.directory) + \
+          "on %s" % what
+    print "to run the new version."
+  elif opts.root:
+    print "Done!"
+  else:
+    print "Done! Restart processes on the SVMs to start using the new version."
+
+#------------------------------------------------------------------------------
+
+def main():
+  opts, args = process_args()
+  executables = find_executables(args)
+  shlibs = gather_all_shlibs(executables)
+  ensure_chrpath_installed(opts)
+  if opts.tarball:
+    # Just package it all up, to be shipped around by hand.
+    make_tarball(opts, executables, shlibs)
+    return 0
+
+  # Look up hostnames and clusters.
+  transfer_dest = resolve_hosts(opts)
+  # Connect to all hosts with ssh.
+  for dest in transfer_dest:
+    dest.connect()
+  # Move all the bits to all the clusters.
+  transfer(transfer_dest, opts, executables, shlibs)
+  return 0
+
+if __name__ == "__main__":
+  sys.exit(main())

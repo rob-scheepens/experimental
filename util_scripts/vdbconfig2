@@ -1,0 +1,3 @@
+sd=sd1,lun=/dev/sdb
+wd=rg-2,sd=sd*,rdpct=100,xfersize=1M,seekpct=0,openflags=directio
+rd=rd_rg-2,wd=rg-2,iorate=32,elapsed=600,interval=1
