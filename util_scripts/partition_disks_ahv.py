@@ -337,6 +337,7 @@ def main():
     help="Number of virtual nodes to create out of this node")  
 
   args = parser.parse_args()
+  args.num_nodes = int(args.num_nodes)
   pd = PartitionDisks(args.host_ip)
   print "Installing utils needed for this script"
   pd.install_utils()
