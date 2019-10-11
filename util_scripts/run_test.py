@@ -25,7 +25,7 @@ gflags.DEFINE_string("last_good_commit_file", "last_good_commit",
                      ("File having the last good commit"))
 
 USERNAME = "gokul.kannan"
-NODE_POOL = "nucloud_cdp"
+NODE_POOL = "cdp_reg_ready"
 POOL_USER = "admin"
 
 def did_nucloud_job_finish(job_id):

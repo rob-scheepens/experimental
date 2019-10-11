@@ -264,7 +264,7 @@ def upload_to_jarvis_database(data):
   url = "http://%s:%s/%s" % (TMP_JARVIS_SERVER, str(TMP_JARVIS_PORT), TMP_NESTED_URL)
 
   req = requests.post(url=url, 
-                json=data['data'], 
+  		      json=data['data'], 
                       # auth = ('AHV2.0', 'qRSgGZrQ?F%#kcPn2NiT'),
                       auth = ('datta.maddikunta', '2700@Irontiger'),
                       verify=False)
@@ -505,6 +505,7 @@ class PartitionDisks(Util):
 
     while retries > 0:
       result = os.system(cmd)
+      print "result is %s" % result
       if result:
         time.sleep(5)
         retries -= 1
@@ -575,7 +576,7 @@ class PartitionDisks(Util):
       for count in xrange(args.num_nodes):
         partition = self.make_partition(disk, start, end)
         disk_partitions_local.append({"name": partition,
-                      "size": partition_size_bytes/GB,
+				      "size": partition_size_bytes/GB,
                                       "type": disk_type})
 
         start = start + partition_size + 1
@@ -629,7 +630,8 @@ def main():
     help="Number of virtual nodes to create out of this node")  
   parser.add_argument(
     "--base_cvm_ip", action='store',
-    help="Number of virtual nodes to create out of this node")
+    help="IP of the base CVM")  
+
 
   args = parser.parse_args()
 
@@ -640,18 +642,20 @@ def main():
 
   #  Cluster object to interact with the cluster.
   cluster_obj = Cluster()
+
   # Check host_ip argument is provided.
-  #if args.host_ip:
+  if args.host_ip:
     # Use the host provided.
-  #  hosts.append(args.host_ip)
-  #else:
+    hosts.append(args.host_ip)
+  else:
     # Get the base CVM IP from the cluster name.
-    #base_cvm_ip = cluster_obj.get_base_cluster_cvm_ip(args.base_cluster_name)
-    #args.base_cvm_ip = base_cvm_ip 
+    base_cvm_ip = cluster_obj.get_base_cluster_cvm_ip(args.base_cluster_name)
+#    args.base_cvm_ip = base_cvm_ip 
+
 
     # Get the CO nodes for the SVM IP.
-  hosts = cluster_obj.get_co_hosts(args.base_cvm_ip)
-  print "CO hosts: %s" % hosts
+    hosts = cluster_obj.get_co_hosts(args.base_cvm_ip)
+
   # Partition disks on each host.
   for host in hosts:
     pd = PartitionDisks(host)
@@ -673,4 +677,3 @@ def main():
        
 if __name__ == "__main__":
   main()
-
