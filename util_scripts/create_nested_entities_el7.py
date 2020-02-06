@@ -267,7 +267,7 @@ def upload_to_jarvis_database(data):
   req = requests.post(url=url, 
   		      json=data['data'], 
                       # auth = ('AHV2.0', 'qRSgGZrQ?F%#kcPn2NiT'),
-                      auth = ('gokul.kannan', 'Thi$isanfield'),
+                      auth = ('gokul.kannan', ''),
                       verify=False)
 
   print "Upload Status", req.content
