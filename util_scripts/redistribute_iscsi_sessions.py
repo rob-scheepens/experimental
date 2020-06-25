@@ -194,6 +194,7 @@ def main(argv):
       continue
     if not FLAGS.dry_run:
       migrate_iscsi_target(target, src_svm_id, dest_svm_id, stargate_master_ip)
+      print "Migrated %s to %s" % (target, dest_svm_id)
     else:
       print "(Dry run) Migrating %s to %s" % (target, dest_svm_id)
 
