@@ -591,7 +591,7 @@ def configure_iser():
   """
   rdma_nics = get_rdma_capable_devices()
   if not rdma_nics:
-    log.error("Could not determine if the node has RDMA NICs. Exiting!")
+    log.error("No RDMA capable NICs found on the node. Exiting!")
     sys.exit(1)
 
   if len(rdma_nics) < MIN_RDMA_NICS:
