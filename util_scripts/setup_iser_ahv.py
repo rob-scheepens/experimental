@@ -81,6 +81,34 @@ class PCI_Address(object):
     """
     return self.pci_address
 
+  @property
+  def domain(self):
+    """
+    The domain field of PCI id.
+    """
+    return self.__domain
+
+  @property
+  def bus(self):
+    """
+    The bus field of the PCI id.
+    """
+    return self.__bus
+
+  @property
+  def slot(self):
+    """
+    The slot field of the PCI id.
+    """
+    return self.__slot
+
+  @property
+  def function(self):
+    """
+    The function field of the PCI id.
+    """
+    return self.__function
+
 def run_command(cmd):
   """
   Runs a command on the localhost and returns output and error values.
@@ -356,17 +384,8 @@ def pass_through_device(pci_address, cvm_domain):
     pci_address(str): PCI address of the device to pass through.
     cvm_domain(str): Name of the CVM domain.
   """
-  cmd = "virsh dumpxml %s" % cvm_domain
-  rv, stdout, stderr = run_command(cmd)
-  if rv:
-    log.error("Failed to dump the CVM info from virsh. Error: (%s, %s)" %
-              (stdout, stderr))
-    return False
-
-  #parser = et.XMLParser()
   cvm_xml_path = "%s/%s.xml" % (CVM_XML_PATH, cvm_domain)
   vm_descriptor = et.parse(cvm_xml_path)
-  # vm_descriptor = et.fromstring(stdout.strip())
   device = vm_descriptor.find("devices")
   hostdevs = device.findall("hostdev")
   slot = 0
@@ -377,25 +396,17 @@ def pass_through_device(pci_address, cvm_domain):
         slot = int(address.get("slot"), 16)
 
   hostdev_slot = slot + 1
-  pci_addr_list = re.split(':|\.', pci_address)
-  # Pci address can be split into domain, bus, slot and function.
-  # In x86_64, domain is usually 0000
-  if len(pci_addr_list) == 4:
-    domain, bus, slot, function = pci_addr_list
-  else:
-    domain = "0000"
-    bus, slot, function = pci_addr_list
+  pci_addr_obj = PCI_Address(pci_address)
 
   hostdev = et.SubElement(device, "hostdev", {  "mode":    "subsystem",
                                                 "type":    "pci",
                                                 "managed": "yes" })
   source = et.SubElement(hostdev, "source")
   et.SubElement(source , "address",
-                                    { "domain":   "0x%s" % domain,
-                                      "bus":      "0x%s" % bus,
-                                      "slot":     "0x%s" % slot,
-                                      "function": "0x%s" % function })
-  #et.SubElement(hostdev, "alias", { "name": "hostdev%d" % i })
+                { "domain":   "0x%s" % pci_addr_obj.domain,
+                  "bus":      "0x%s" % pci_addr_obj.bus,
+                  "slot":     "0x%s" % pci_addr_obj.slot,
+                  "function": "0x%s" % pci_addr_obj.function })
   et.SubElement(hostdev, "rom", { "bar": "off" })
   et.SubElement(hostdev, "address",
                                    { "domain":    "0x0000",
@@ -607,10 +618,12 @@ def configure_iser():
     sys.exit(1)
 
   if is_cvm_up(cvm_domain_name):
+    log.info("Shutting down the SVM")
     if not shutdown_cvm(cvm_domain_name):
       log.error("Failed to shutdown CVM")
       sys.exit(1)
 
+  log.info("Selected NIC with PCI id %s for iSER" % selected_device_for_iser)
   vfs = create_pass_through_vfs(selected_device_for_iser)
   if not vfs:
     # Undo any VFs created on the interface.
@@ -640,7 +653,7 @@ def configure_iser():
   if rv:
     log.error("Failed to add route. Error: (%s, %s)" % (stdout, stderr))
 
-  print ("iSER has been set up on the AHV host. Please assign %s IP to the"
+  log.info("iSER has been set up on the AHV host. Please assign %s IP to the"
     " interface with mac address %s on the SVM." % (CVM_ISER_IP, svm_mac_addr))
 
 def main():
