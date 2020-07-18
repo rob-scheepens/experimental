@@ -3,13 +3,13 @@
 Copyright (c) 2020 Nutanix Inc. All rights reserved.
 Author: gokul.kannan@nutanix.com
 
-This script uses SRIOV and creates Virtual Functions on RDMA capable port. It
-then passes through one VF to the CVM. Copy this script to the AHV node and
-run it as:
-./setup_iser_ahv.py
+This module configures RDMA on the AHV host. This module does a pass through of
+NICs and/or VFs to the CVM and assigns IP addresses to the RDMA interfaces
+created on the AHV host.
 """
 
 import glob
+import json
 import logging
 import logging.handlers
 import os
@@ -22,17 +22,26 @@ import uuid
 import xml.etree.ElementTree  as et
 
 
+# Vendor ID of the NICs on which we support RDMA.
 RDMA_CAPABLE_NICS = ["15b3:1013", "15b3:1015"]
 
-CVM_XML_PATH = "/etc/libvirt/qemu/"
+# Path to the CVM xml file.
+CVM_XML_PATH = "/etc/libvirt/qemu/{}.xml"
 
+# IPs to be used for ISER
 AHV_ISER_IP = "192.168.5.3"
-
 CVM_ISER_IP = "192.168.5.4"
 
+# Minimum number of NICS to be present on the node for us to consider
+# configuring RDMA.
 MIN_RDMA_NICS = 2
 
+# Number of VFs to create on the RDMA capable NIC.
 NUM_VFs = 2
+
+# RDMA config file path
+RDMA_CONFIG_FILE_PATH = "/run/rdma-config.json"
+
 
 class PCI_Address(object):
   """
@@ -123,9 +132,10 @@ def run_command(cmd):
 
 def get_rdma_capable_devices():
   """
-  Find and return all the devices which are rdma capable.
+  Find and return all the devices which support RDMA and which have been
+  qualified for our solution.
   Returns:
-    list of PCI_Address objects of the rdma capable ports.
+    list of PCI id of the rdma capable ports sorted by PCI ids.
   """
   rdma_nics = []
   rv, stdout, stderr = run_command("lspci -n")
@@ -138,21 +148,20 @@ def get_rdma_capable_devices():
     if line.split()[2].strip() in RDMA_CAPABLE_NICS:
       pci_id = line.split()[0].strip()
       pci_id_obj = PCI_Address(pci_id)
-      # vendor_id = line.split()[2].strip()
       rdma_nics.append(pci_id_obj.pci_address_string)
 
   return rdma_nics
 
-def shutdown_cvm(cvm_domain_name):
+def shutdown_vm(vm_domain_name):
   """
   Shutdown the CVM:
   Args:
-    cvm_domain_name(str): virsh domain name of the CVM.
+    vm_domain_name(str): virsh domain name of the VM.
   """
-  cmd = "virsh shutdown %s" % cvm_domain_name
+  cmd = "virsh shutdown %s" % vm_domain_name
   rv, stdout, stderr = run_command(cmd)
   if rv:
-    log.error("Failed to shutdown the CVM. Error:( %s, %s)" % (stdout,
+    log.error("Failed to shutdown the VM. Error:( %s, %s)" % (stdout,
       stderr))
     return False
 
@@ -160,7 +169,7 @@ def shutdown_cvm(cvm_domain_name):
   sleep_time = 10
   total_wait_time = 300
   while expired_time < total_wait_time:
-    if is_cvm_up(cvm_domain_name):
+    if is_vm_up(vm_domain_name):
       time.sleep(10)
       expired_time += sleep_time
     else:
@@ -168,16 +177,16 @@ def shutdown_cvm(cvm_domain_name):
 
   return False
 
-def start_cvm(cvm_domain_name):
+def start_vm(vm_domain_name):
   """
-  Start the CVM.
+  Start the VM.
   Args:
-    cvm_domain_name(str): virsh domain name of the CVM.
+    vm_domain_name(str): virsh domain name of the CVM.
   """
-  cmd = "virsh start %s" % cvm_domain_name
+  cmd = "virsh start %s" % vm_domain_name
   rv, stdout, stderr = run_command(cmd)
   if rv:
-    log.error("Failed to start the CVM. Error:( %s, %s)" % (stdout,
+    log.error("Failed to start the VM. Error:( %s, %s)" % (stdout,
       stderr))
     return False
 
@@ -185,7 +194,7 @@ def start_cvm(cvm_domain_name):
   sleep_time = 10
   total_wait_time = 300
   while expired_time < total_wait_time:
-    if not is_cvm_up(cvm_domain_name):
+    if not is_vm_up(vm_domain_name):
       time.sleep(10)
       expired_time += sleep_time
     else:
@@ -193,14 +202,16 @@ def start_cvm(cvm_domain_name):
 
   return False
 
-def is_cvm_up(cvm_domain_name):
+def is_vm_up(vm_domain_name):
   """
-  Check if CVM is up.
+  Check if the given VM is up.
+  Args:
+    vm_domain_name(str): Virsh domain name.
   """
-  cmd = "virsh domstate %s" % cvm_domain_name
+  cmd = "virsh domstate %s" % vm_domain_name
   rv, stdout, stderr = run_command(cmd)
   if rv:
-    log.error("Failed to get state of the CVM. Error:( %s, %s)" % (stdout,
+    log.error("Failed to get state of the VM. Error:( %s, %s)" % (stdout,
       stderr))
     return False
 
@@ -296,13 +307,30 @@ def set_interfaces_up(interfaces):
 
   return True
 
+def set_vf_mac_address(pf, vf_index, mac_address):
+  """
+  Set the mac address on the VF.
+  Args:
+    pf(str): The physical function interface name.
+    vf_index(int): Index number of the VF.
+  """
+  cmd = "ip link set {0} vf {1} mac {2}".format(pf, vf_index, mac_address)
+  rv, stdout, stderr = run_command(cmd)
+  if rv:
+    log.error("Failed to set mac address on the VF. Error:(%s, %s)" %
+              (stdout, stderr))
+
+  return True
+
+
 def get_vf_details(pf):
   """
   Get the PCI addresses of all the VFs for the given PF.
   Args:
     pf(str): Interface name of the physical function.
   Returns:
-    list: A list of dicts containing the interface name and pci address.
+    list: A list of dicts containing the interface name, pci address and vf
+          index.
   """
   path = "/sys/class/net/%s/device" % pf
   files = os.listdir(path)
@@ -312,6 +340,7 @@ def get_vf_details(pf):
     return False
   for filename in files:
     if "virtfn" in filename:
+      vf_index = int(filename.split("virtfn")[1])
       file_path = os.path.join(path, filename)
       target_file = os.readlink(file_path)
       pci_address = os.path.basename(target_file)
@@ -319,7 +348,8 @@ def get_vf_details(pf):
       interface_name = get_nw_interface_name_from_pci_address(
         pci_ad_obj.pci_address_string)
       vf_details.append({"pci_address": pci_ad_obj.pci_address_string,
-                        "interface_name": interface_name})
+                        "interface_name": interface_name,
+                        "vf_index": vf_index})
 
   return vf_details
 
@@ -331,17 +361,19 @@ def get_nw_interface_name_from_pci_address(pci_address):
   """
   ethtool_cmd = "ethtool -i {0}"
   ip_link_cmd = "ip link show {0}"
-  # First get all the network interfaces on PCi devices.
   pci_base = "/sys/devices/pci"
   for intf_path in glob.glob("/sys/class/net/*"):
+    # Check the interface is a PCIe device. Ignore if not.
     if not os.path.realpath(intf_path).startswith(pci_base):
       continue
+
     iface = os.path.basename(intf_path)
     rv, out, err = run_command(ethtool_cmd.format(iface))
     if rv:
       log.error("Failed to run ethtool command. Error: (%s, %s)" % (out,
         err))
       return False
+
     for entry in out.strip().splitlines():
       if "bus-info" in entry:
         if len(entry.split()) < 2 or \
@@ -354,6 +386,16 @@ def get_nw_interface_name_from_pci_address(pci_address):
         break
 
   return None
+
+def get_mac_address(iface_name):
+  """
+  Return the mac address for the interface.
+  Args:
+    iface_name(str): Name of the interface.
+  """
+  file_name = "/sys/class/net/%s/address" % iface_name
+  with open(file_name) as fl:
+    return  fl.read().strip()
 
 def get_ib_dev_from_interface_name(interface_name):
   """
@@ -376,16 +418,14 @@ def get_ib_dev_from_interface_name(interface_name):
 
   return None
 
-
-def pass_through_device(pci_address, cvm_domain):
+def pass_through_device(pci_address, vm_xml_path):
   """
-  Pass through the given device to the CVM.
+  Pass through the given PCI device to the CVM.
   Args:
     pci_address(str): PCI address of the device to pass through.
-    cvm_domain(str): Name of the CVM domain.
+    vm_xml_path(str): Path to the VM XML file.
   """
-  cvm_xml_path = "%s/%s.xml" % (CVM_XML_PATH, cvm_domain)
-  vm_descriptor = et.parse(cvm_xml_path)
+  vm_descriptor = et.parse(vm_xml_path)
   device = vm_descriptor.find("devices")
   hostdevs = device.findall("hostdev")
   slot = 0
@@ -414,18 +454,17 @@ def pass_through_device(pci_address, cvm_domain):
                                      "slot":      "0x%x" % hostdev_slot,
                                      "function":  "0x0",
                                      "type":      "pci"})
-  vm_descriptor.write(cvm_xml_path)
+  vm_descriptor.write(vm_xml_path)
   return True
 
-def is_device_pass_through(pci_address, cvm_domain):
+def is_device_pass_through(pci_address, vm_xml_path):
   """
   Check if the device with the pci_address has been passed through to the cvm.
   Args:
     pci_address(str): PCI address of the device.
-    cvm_domain(str): Name of the CVM domain.
+    vm_xml_path(str): Path of the VM xml file.
   """
-  cvm_xml_path = "%s/%s.xml" % (CVM_XML_PATH, cvm_domain)
-  vm_descriptor = et.parse(cvm_xml_path)
+  vm_descriptor = et.parse(vm_xml_path)
   device = vm_descriptor.find("devices")
   hostdevs = device.findall("hostdev")
   for hostdev in hostdevs:
@@ -440,15 +479,14 @@ def is_device_pass_through(pci_address, cvm_domain):
 
   return False
 
-def remove_pass_through_device(pci_address, cvm_domain):
+def remove_pass_through_device(pci_address, vm_xml_path):
   """
   Remove the pass through device from the CVM xml file.
   Args:
     pci_address(str): PCI address of the device.
-    cvm_domain(str): Name of the CVM domain.
+    vm_xml_path(str): Path of the VM xml file.
   """
-  cvm_xml_path = "%s/%s.xml" % (CVM_XML_PATH, cvm_domain)
-  vm_descriptor = et.parse(cvm_xml_path)
+  vm_descriptor = et.parse(vm_xml_path)
   device = vm_descriptor.find("devices")
   hostdevs = device.findall("hostdev")
   hostdev_to_remove = None
@@ -465,7 +503,7 @@ def remove_pass_through_device(pci_address, cvm_domain):
 
   if hostdev_to_remove is not None:
     device.remove(hostdev_to_remove)
-    vm_descriptor.write("%s/%s.xml" % (CVM_XML_PATH, cvm_domain))
+    vm_descriptor.write(vm_xml_path)
     return True
 
   return False
@@ -488,56 +526,39 @@ def get_cvm_domain_name():
         return words[1]
   return None
 
-def reload_cvm_xml(cvm_domain_name):
+def reload_vm_xml(vm_xml_path):
   """
   Define the CVM using virsh.
   Args:
-    cvm_domain_name(str): Domain Name of the CVM.
+    vm_xml_path(str): Path to the VM XML file.
   """
-  cvm_xml_path = "%s/%s.xml" % (CVM_XML_PATH, cvm_domain_name)
-  rv, stdout, stderr = run_command("virsh define %s" % cvm_xml_path)
+  rv, stdout, stderr = run_command("virsh define %s" % vm_xml_path)
   if rv:
-    log.error("Failed to define CVM XML Error: (%s, %s)" % (stdout, stderr))
+    log.error("Failed to define VM XML Error: (%s, %s)" % (stdout, stderr))
     return False
 
   return True
 
-def get_mac_address(iface_name):
-  """
-  Return the mac address for the interface.
-  Args:
-    iface_name(str): Name of the interface.
-  """
-  file_name = "/sys/class/net/%s/address" % iface_name
-  with open(file_name) as fl:
-    return  fl.read().strip()
 
-def create_pass_through_vfs(pf_pci_address):
+def create_configure_vfs(pf_pci_address, num_vfs=2):
   """
-  Configure VFs on the AHV hosts and pass it to the SVM.
+  Configure VFs on the given physical interface.
   Args:
     pf_pci_address(str): PCI address of the physical interface.
   """
-  cvm_domain_name = get_cvm_domain_name()
-  if not cvm_domain_name:
-    log.error("Failed to get CVM domain name")
-    return False
-
   pf_interface_name = \
     get_nw_interface_name_from_pci_address(pf_pci_address)
 
-  # TODO: Add checks here to make sure the selected interface isn't part of
-  # the br0 bond.
-  if not create_virtual_functions(pf_interface_name, NUM_VFs):
+  if not create_virtual_functions(pf_interface_name, num_vfs):
     log.error("Failed to create VFs.")
-    sys.exit(1)
+    return False
 
   ib_dev_name = get_ib_dev_from_interface_name(pf_interface_name)
   if not ib_dev_name:
     log.error("Failed to get the IB dev name from interface")
     return False
 
-  for index in xrange(NUM_VFs):
+  for index in xrange(num_vfs):
     if not assign_uuid_vf(ib_dev_name, index):
       log.error("Failed to assign uuid to the VFs")
       return False
@@ -557,48 +578,171 @@ def create_pass_through_vfs(pf_pci_address):
     log.error("Failed to rebind VFs")
     return False
 
-  for index in xrange(NUM_VFs):
-    if not enable_vf(pf_interface_name, index):
+  for vf in vf_details:
+    if not enable_vf(pf_interface_name, vf["vf_index"]):
       log.error("Failed to enable VF")
       return False
+
+  # Every time VF is intialized the mac address of the VF changes. Hence set
+  # the mac address here.
+  for vf in vf_details:
+    mac_address = get_mac_address(vf["interface_name"])
+    if not set_vf_mac_address(pf_interface_name, vf["vf_index"], mac_address):
+      log.error("Failed to set mac address for the VF:%s" % vf)
+      return False
+    vf["mac_address"] = mac_address
 
   if not set_interfaces_up(vf_interfaces):
     log.error("Failed to bring the interfaces up")
     return False
 
-  if is_device_pass_through(pf_pci_address,
-      cvm_domain_name):
-    remove_pass_through_device(pf_pci_address,
-        cvm_domain_name)
+  return vf_details
 
-  # Pass through the first VF:
+def get_bond_interfaces(bond_name=None):
+  """
+  Return the list of interfaces present in the bond.
+  Args:
+    bond_name(str): Name of the bond. If None return all interfaces which are
+                    part of a bond.
+  Returns a list of interfaces.
+  """
+  if bond_name is not None:
+    cmd = "ovs-appctl bond/show %s" % bond_name
+  else:
+    cmd = "ovs-appctl bond/show"
+
+  rv, stdout, stderr = run_command(cmd)
+  if rv:
+    log.error("Failed to get the bond information of %s. Error: (%s, %s)" %
+      (bond_name, stdout, stderr))
+
+  interfaces = []
+  for line in stdout.strip().splitlines():
+    if line.startswith("slave"):
+      interfaces.append(line.strip().split()[1])
+    continue
+
+  return interfaces
+
+def select_ports_for_rdma(rdma_ports):
+  """
+  This method will hold the logic to select ports for doing RF2 RDMA and iSER.
+  RF2 RDMA is CVM to CVM communication over RDMA and iSER is for Frodo to
+  Stargate communication over RDMA.
+  Args:
+    rdma_ports(list): List of RDMA capable ports.
+  Returns a dict with rdma and iser ports.
+  """
+  # The rdma_ports passed are sorted in order of bus ids. The port with lowest
+  # bus id is connected to external switch. That port will be used for RF2
+  # RDMA. The second port of the same NIC is unconnected and hence will be
+  # used for iSER RDMA. This logic assumes that we will always have
+  # NICs connected and configured in a certain way. In future we can some more
+  # logic here so that we don't have to rely on assumptions.
+  rf2_port = rdma_ports[0]
+  iser_port = rdma_ports[1]
+  rf2_inf = get_nw_interface_name_from_pci_address(rf2_port)
+  iser_inf = get_nw_interface_name_from_pci_address(iser_port)
+  bond_interfaces = get_bond_interfaces()
+
+  # Check if the interfaces are part of any bonds on the node. When RF2 RDMA is 
+  # handled via this script, expand the check below to include rf2_inf also.
+  if iser_inf in bond_interfaces:
+    log.error("Interface %s is part of a bond. Not configuring iSER on it." % iser_inf)
+    return False
+
+  return {"rf2": rf2_port, "iser": iser_port}
+
+def cleanup_sriov(device):
+  """
+  Cleanup any SRIOV changes done on the device.
+  Args:
+    device(str): PCI id of the interface to be cleaned.
+  """
+  pf_interface_name = get_nw_interface_name_from_pci_address(
+    device)
+  create_virtual_functions(pf_interface_name, 0)
+
+def configure_iser(iser_device, create_vfs=True):
+  """
+  Configures the given device for iser. Creates VF on the given device if
+  needed and passes it through to the CVM.
+  Args:
+    iser_device(str): PCI id of the device to be used for iser.
+    create_vfs(bool): Should VFs be created on this device.
+  """
+  log.info("Selected NIC with PCI id %s for iSER" % iser_device)
+  cvm_domain_name = get_cvm_domain_name()
+  cvm_xml_path = CVM_XML_PATH.format(cvm_domain_name)
+  if create_vfs:
+    vf_details = create_configure_vfs(iser_device, NUM_VFs)
+  else:
+    # TODO: This is the case where the VFs were already created. Get the interface 
+    # details here.
+    vf_details = None
+
+  if not vf_details:
+    # Undo any VFs created on the interface.
+    cleanup_sriov(iser_device)
+    log.error("RDMA config failed.\n Exiting")
+    return False
+
+  # Remove the device if it has already been passed through.
+  if is_device_pass_through(iser_device, cvm_xml_path):
+    remove_pass_through_device(iser_device, cvm_xml_path)
+
+  # Pass through the first VF to the SVM for iSER.
   pass_through_vf = vf_details[0]
   ahv_vf = vf_details[1]
-  if is_device_pass_through(ahv_vf["pci_address"], cvm_domain_name):
+  if is_device_pass_through(ahv_vf["pci_address"], cvm_xml_path):
     log.error("VF assigned to AHV has been passed through. Removing it.")
-    remove_pass_through_device(ahv_vf["pci_address"], cvm_domain_name)
+    remove_pass_through_device(ahv_vf["pci_address"], cvm_xml_path)
 
   if is_device_pass_through(pass_through_vf["pci_address"],
-    cvm_domain_name):
+      cvm_xml_path):
     log.error("VF already passed through")
-    return {"pass_through_vf": pass_through_vf, "ahv_vf": ahv_vf}
-
-  if not pass_through_device(pass_through_vf["pci_address"],
-    cvm_domain_name):
+  elif not pass_through_device(pass_through_vf["pci_address"],
+      cvm_xml_path):
     log.error("Failed to pass through VF to the CVM")
     return False
 
-  if not reload_cvm_xml(cvm_domain_name):
+  if not reload_vm_xml(cvm_xml_path):
     log.error("Failed to reload the CVM XML")
     remove_pass_through_device(pass_through_vf["pci_address"],
-      cvm_domain_name)
+      cvm_xml_path)
+    cleanup_sriov(iser_device)
+    return False
+
+  # Assign IP address to the AHV VF and add route to the linux routing table.
+  cmd ="ifconfig %s %s/24 up" % (ahv_vf["interface_name"], AHV_ISER_IP)
+  rv, stdout, stderr = run_command(cmd)
+  if rv:
+    log.error("Failed to assign IP Address to interface on AHV. Error: "
+              "(%s, %s)" % (stdout, stderr))
+    cleanup_sriov(iser_device)
+    return False
+
+  # Add route to the linux routing table.
+  cmd = "route add -host %s dev %s" % (CVM_ISER_IP, ahv_vf["interface_name"])
+  rv, stdout, stderr = run_command(cmd)
+  if rv:
+    log.error("Failed to add route. Error: (%s, %s)" % (stdout, stderr))
+    cleanup_sriov(iser_device)
     return False
 
   return {"pass_through_vf": pass_through_vf, "ahv_vf": ahv_vf}
 
-def configure_iser():
+def configure_rf2_rdma(rf2_device):
   """
-  Main method which configures iSER on AHV.
+  Args:
+    rf2_device(str): PCI id of the devie to be used for rf2 RDMA.
+  """
+  # This is currently taken care of by foundation.
+  pass
+
+def configure_rdma():
+  """
+  Main method which configures RDMA on AHV node.
   """
   rdma_nics = get_rdma_capable_devices()
   if not rdma_nics:
@@ -610,57 +754,48 @@ def configure_iser():
               " %d.\nExiting" % (len(rdma_nics), MIN_RDMA_NICS))
     sys.exit(1)
 
-  # Select the unconnected port of the NIC with lowest bus id.
-  selected_device_for_iser = rdma_nics[1]
+  rdma_config_ports = select_ports_for_rdma(rdma_nics)
+  if not rdma_config_ports:
+    log.error("Could not find eligible ports for RDMA. Exiting!")
+    sys.exit(1)
+
+  # In future, we might decide not to dedicate the complete ports for iSER
+  # and RDMA. Instead we would create the VFs on a given port and then assign
+  # those VFs for iSER and RF2 RDMA. In that scenario, we will call
+  # create_configure_vfs() method on the port and then select VFs from the
+  # returned list.
+  selected_device_for_iser = rdma_config_ports["iser"]
+  selected_device_for_rf2 = rdma_config_ports["rf2"]
   cvm_domain_name = get_cvm_domain_name()
   if not cvm_domain_name:
     log.error("Failed to get CVM domain name")
     sys.exit(1)
 
-  if is_cvm_up(cvm_domain_name):
+  if is_vm_up(cvm_domain_name):
     log.info("Shutting down the SVM")
-    if not shutdown_cvm(cvm_domain_name):
+    if not shutdown_vm(cvm_domain_name):
       log.error("Failed to shutdown CVM")
       sys.exit(1)
 
-  log.info("Selected NIC with PCI id %s for iSER" % selected_device_for_iser)
-  vfs = create_pass_through_vfs(selected_device_for_iser)
-  if not vfs:
-    # Undo any VFs created on the interface.
-    pf_interface_name = get_nw_interface_name_from_pci_address(
-      selected_device_for_iser)
-    create_virtual_functions(pf_interface_name, 0)
-    start_cvm(cvm_domain_name)
-    log.error("iSER config failed.\n Exiting")
-    sys.exit(1)
+  iser_config = configure_iser(selected_device_for_iser, create_vfs=True)
+  rf2_config = configure_rf2_rdma(selected_device_for_rf2)
+  iser_cvm_mac_addr = iser_config["pass_through_vf"]["mac_address"]
 
-  svm_mac_addr = get_mac_address(vfs["pass_through_vf"]["interface_name"])
-  if not start_cvm(cvm_domain_name):
+  if not start_vm(cvm_domain_name):
     log.error("Failed to start the CVM after VF creation")
     sys.exit(1)
 
-  # Assign IP address to the AHV VF and add route to the linux routing table.
-  cmd ="ifconfig %s %s/24 up" % (vfs["ahv_vf"]["interface_name"], AHV_ISER_IP)
-  rv, stdout, stderr = run_command(cmd)
-  if rv:
-    log.error("Failed to assign IP Address to interface on AHV. Error: "
-              "(%s, %s)" % (stdout, stderr))
-
-  # Add route to the linux routing table.
-  cmd = "route add -host %s dev %s" % (CVM_ISER_IP,
-    vfs["ahv_vf"]["interface_name"])
-  rv, stdout, stderr = run_command(cmd)
-  if rv:
-    log.error("Failed to add route. Error: (%s, %s)" % (stdout, stderr))
-
-  log.info("iSER has been set up on the AHV host. Please assign %s IP to the"
-    " interface with mac address %s on the SVM." % (CVM_ISER_IP, svm_mac_addr))
+  # Finally record the mac address of the passed through interface here for CVM
+  # to lookup later.
+  rdma_config_json =  {"iser": {"cvm_mac_address": iser_cvm_mac_addr}}
+  with open(RDMA_CONFIG_FILE_PATH, "w") as rdma_config_file:
+    rdma_config_file.write(json.dumps(rdma_config_json, indent=2))
 
 def main():
   """
   Main method
   """
-  configure_iser()
+  configure_rdma()
 
 if __name__ == "__main__":
   logging.basicConfig()
