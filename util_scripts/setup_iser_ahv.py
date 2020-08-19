@@ -23,7 +23,7 @@ import xml.etree.ElementTree  as et
 
 
 # Vendor ID of the NICs on which we support RDMA.
-RDMA_CAPABLE_NICS = ["15b3:1013", "15b3:1015"]
+RDMA_CAPABLE_NICS = ["15b3:1013","15b3:1015","15b3:1017"]
 
 # Path to the CVM xml file.
 CVM_XML_PATH = "/etc/libvirt/qemu/{}.xml"
